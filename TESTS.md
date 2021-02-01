@@ -431,12 +431,39 @@ type family Closed (a :: k) :: Bool where
   Closed x = 'True
 ```
 
+Unboxed sum types
+
+```haskell
+{-# LANGUAGE UnboxedSums #-}
+{-# LANGUAGE UnboxedTuples #-}
+
+f :: (# (# Int, String #) | String #) -> (# Int | String #)
+f (# (# n, _ #) | #) = (# n | #)
+f (# | b #) = (# | b #)
+
+f' ::
+     (#  (# Int, String #)
+       | Either Bool Int
+       | Either Bool Int
+       | Either Bool Int
+       | Either Bool Int
+       | Either Bool Int
+       | String #)
+  -> (# Int | String #)
+```
+
 # Template Haskell
 
 Expression brackets
 
 ```haskell
 add1 x = [|x + 1|]
+```
+
+Typed expression brackets
+
+```haskell
+add1 x = [||x + 1||]
 ```
 
 Pattern brackets
@@ -449,6 +476,12 @@ Type brackets
 
 ```haskell
 foo :: $([t|Bool|]) -> a
+```
+
+Typed variable splice
+
+```haskell
+add2Typed = [||$$myFuncTyped . $$(myFuncTyped)||]
 ```
 
 Quoted data constructors
@@ -1416,6 +1449,38 @@ newtype Number a =
   deriving (Generic)
   deriving newtype (Show, Eq)
   deriving anyclass (Typeable)
+```
+
+Deriving via
+```haskell
+{-# LANGUAGE DerivingVia #-}
+
+import Numeric
+
+newtype Hex a =
+  Hex a
+
+instance (Integral a, Show a) => Show (Hex a) where
+  show (Hex a) = "0x" ++ showHex a ""
+
+newtype Unicode =
+  U Int
+  deriving (Show) via (Hex Int)
+  deriving ( Functor
+           , Applicative
+           , Monad
+           , Semigroup
+           , Monoid
+           , Alternative
+           , MonadPlus
+           , Foldable
+           , Traversable
+           ) via (Hex Int)
+
+-- >>> euroSign
+-- 0x20ac
+euroSign :: Unicode
+euroSign = U 0x20ac
 ```
 
 neongreen "{" is lost when formatting "Foo{}" #366

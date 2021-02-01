@@ -16,11 +16,11 @@ module HIndent.Pretty
 import           Control.Applicative
 import           Control.Monad.State.Strict hiding (state)
 import qualified Data.ByteString.Builder as S
-import           Data.Foldable (for_, forM_, traverse_)
+import           Data.Foldable (for_, traverse_)
 import           Data.Int
 import           Data.List
-import           Data.Maybe
 import           Data.Monoid ((<>))
+import           Data.Maybe
 import           Data.Typeable
 import           HIndent.Types
 import qualified Language.Haskell.Exts as P
@@ -412,6 +412,9 @@ instance Pretty Pat where
       PXRPats{} -> pretty' x
       PVar{} -> pretty' x
       PSplice _ s -> pretty s
+#if MIN_VERSION_haskell_src_exts(1,20,0)
+      (PUnboxedSum _ nLeft nRight p) -> unboxedSumValuePattern nLeft nRight p
+#endif
 
 -- | Pretty infix application of a name (identifier or symbol).
 prettyInfixName :: Name NodeInfo -> Printer ()
@@ -485,7 +488,9 @@ exp (TupleSection _ boxed mexps) = do
     parensHorB Unboxed = wrap "(# " " #)"
     parensVerB Boxed = parens
     parensVerB Unboxed = wrap "(#" "#)"
-exp (UnboxedSum{}) = error "FIXME: No implementation for UnboxedSum."
+#if MIN_VERSION_haskell_src_exts(1,20,0)
+exp (UnboxedSum _ nLeft nRight e) = unboxedSumValuePattern nLeft nRight e
+#endif
 -- | Infix apps, same algorithm as ChrisDone at the moment.
 exp e@(InfixApp _ a op b) =
   infixApp e a op b Nothing
@@ -936,19 +941,23 @@ instance Pretty TypeEqn where
 
 instance Pretty Deriving where
   prettyInternal (Deriving _ strategy heads) =
-    depend (write "deriving" >> space >> writeStrategy) $ do
-      let heads' =
-            if length heads == 1
-              then map stripParens heads
-              else heads
-      maybeDerives <- fitsOnOneLine $ parens (commas (map pretty heads'))
-      case maybeDerives of
-        Nothing -> formatMultiLine heads'
-        Just derives -> put derives
+    depend (write "deriving" >> space) $
+    case strategy of
+      Nothing -> printHeads
+#if MIN_VERSION_haskell_src_exts(1,21,0)
+      Just st@(DerivVia _ _) -> printHeads >> space >> pretty st
+#endif
+      Just st -> depend (pretty st >> space) $ printHeads
     where
-      writeStrategy = case strategy of
-        Nothing -> return ()
-        Just st -> pretty st >> space
+      printHeads = do
+        let heads' =
+              if length heads == 1
+                then map stripParens heads
+                else heads
+        maybeDerives <- fitsOnOneLine $ parens (commas (map pretty heads'))
+        case maybeDerives of
+          Nothing -> formatMultiLine heads'
+          Just derives -> put derives
       stripParens (IParen _ iRule) = stripParens iRule
       stripParens x = x
       formatMultiLine derives = do
@@ -962,6 +971,9 @@ instance Pretty DerivStrategy where
       DerivStock _ -> return ()
       DerivAnyclass _ -> write "anyclass"
       DerivNewtype _ -> write "newtype"
+#if MIN_VERSION_haskell_src_exts(1,21,0)
+      DerivVia _ t -> depend (write "via" >> space) $ pretty t
+#endif
 
 instance Pretty Alt where
   prettyInternal x =
@@ -976,6 +988,14 @@ instance Pretty Alt where
                   indentedBlock (depend (write "where ")
                                 (pretty binds))
 
+#if MIN_VERSION_haskell_src_exts(1,22,0)
+instance Pretty Asst where
+  prettyInternal x =
+    case x of
+      ParenA _ asst -> parens $ pretty asst
+      IParam _ name ty -> pretty name >> write " :: " >> pretty ty
+      TypeA _ ty -> pretty ty
+#else
 instance Pretty Asst where
   prettyInternal x =
     case x of
@@ -1001,6 +1021,7 @@ instance Pretty Asst where
           Just n -> do
             write "_"
             pretty n
+#endif
 #endif
 
 instance Pretty BangType where
@@ -1186,9 +1207,19 @@ instance Pretty Splice where
       IdSplice _ str ->
         do write "$"
            string str
+#if MIN_VERSION_haskell_src_exts(1,22,0)
+      TIdSplice _ str ->
+        do write "$$"
+           string str
+#endif
       ParenSplice _ e ->
         depend (write "$")
                (parens (pretty e))
+#if MIN_VERSION_haskell_src_exts(1,22,0)
+      TParenSplice _ e ->
+        depend (write "$$")
+               (parens (pretty e))
+#endif
 
 instance Pretty InstRule where
   prettyInternal (IParen _ rule) = parens $ pretty rule
@@ -1412,6 +1443,14 @@ instance Pretty Bracket where
   prettyInternal x =
     case x of
       ExpBracket _ p -> quotation "" (pretty p)
+#if MIN_VERSION_haskell_src_exts(1,22,0)
+      TExpBracket _ p ->
+        brackets
+          (depend
+             (write "||")
+             (do pretty p
+                 write "||"))
+#endif
       PatBracket _ p -> quotation "p" (pretty p)
       TypeBracket _ ty -> quotation "t" (pretty ty)
       d@(DeclBracket _ _) -> pretty' d
@@ -1851,7 +1890,12 @@ typ (TyWildCard _ name) =
       do write "_"
          pretty n
 typ (TyQuasiQuote _ n s) = quotation n (string s)
-typ (TyUnboxedSum{}) = error "FIXME: No implementation for TyUnboxedSum."
+#if MIN_VERSION_haskell_src_exts(1,20,0)
+typ (TyUnboxedSum _ types) = do
+  let horVar = wrap "(# " " #)" $ inter (write " | ") (map pretty types)
+  let verVar = wrap "(# " " #)" $ prefixedLined "|" (map (depend space . pretty) types)
+  horVar `ifFitsOnOneLineOrElse` verVar
+#endif
 #if MIN_VERSION_haskell_src_exts(1,21,0)
 typ (TyStar _) = write "*"
 #endif
@@ -1958,15 +2002,6 @@ declTy dty =
                 tys -> prefixedLined "-> " (map pretty tys)
             Just st -> put st
 
--- | Use special record display, used by 'dataDecl' in a record scenario.
-qualConDecl :: QualConDecl NodeInfo -> Printer ()
-qualConDecl (QualConDecl _ tyvars ctx d) =
-  depend (unless (null (fromMaybe [] tyvars))
-                 (do write "forall "
-                     spaced (map pretty (fromMaybe [] tyvars))
-                     write ". "))
-         (withCtx ctx (recDecl d))
-
 -- | Fields are preceded with a space.
 conDecl :: ConDecl NodeInfo -> Printer ()
 conDecl (RecDecl _ name fields) = do
@@ -1991,22 +2026,6 @@ conDecl (ConDecl _ name bangty) = do
 conDecl (InfixConDecl _ a f b) =
   inter space [pretty a, pretty f, pretty b]
 
--- | Record decls are formatted like: Foo
--- { bar :: X
--- }
-recDecl :: ConDecl NodeInfo -> Printer ()
-recDecl (RecDecl _ name fields) =
-  do pretty name
-     indentSpaces <- getIndentSpaces
-     newline
-     column indentSpaces
-            (do depend (write "{!")
-                       (prefixedLined ","
-                                      (map (depend space . pretty) fields))
-                newline
-                write "}")
-recDecl r = prettyInternal r
-
 recUpdateExpr :: Printer () -> [FieldUpdate NodeInfo] -> Printer ()
 recUpdateExpr expWriter updates = do
   ifFitsOnOneLineOrElse hor $ do
@@ -2026,11 +2045,6 @@ recUpdateExpr expWriter updates = do
 
 --------------------------------------------------------------------------------
 -- Predicates
-
--- | Is the decl a record?
-isRecord :: QualConDecl t -> Bool
-isRecord (QualConDecl _ _ _ RecDecl{}) = True
-isRecord _ = False
 
 -- | If the given operator is an element of line breaks in configuration.
 isLineBreak :: QName NodeInfo -> Printer Bool
@@ -2149,3 +2163,29 @@ quotation quoter body =
            write "|")
        (do body
            write "|"))
+
+-- | Write an UnboxedSum value/pattern.
+--
+-- >>> unboxedSumValuePattern 0 1 (Var  (UnQual  (Ident  "n")))
+-- (# n | #)
+-- >>> unboxedSumValuePattern 0 1 (PTuple  Unboxed [PVar  (Ident  "n"),PWildCard ])
+-- (# (# n, _ #) | #)
+-- >>> unboxedSumValuePattern 1 0 (PVar  (Ident  "b"))
+-- (# | b #)
+-- >>> unboxedSumValuePattern 1 0 (Var  (UnQual  (Ident  "b")))
+-- (# | b #)
+unboxedSumValuePattern
+  :: (Pretty ast, Show (ast NodeInfo))
+  => Int
+  -- ^ Number of types from the left.
+  -> Int
+  -- ^ Number of types from the right.
+  -> ast NodeInfo
+  -- ^ Value/Pattern.
+  -> Printer ()
+  -- ^ UnboxedSum Printer.
+unboxedSumValuePattern nLeft nRight e = do
+  wrap "(# " " #)" $ do
+    replicateM_ nLeft (write "| ")
+    pretty e
+    replicateM_ nRight (write " |")
